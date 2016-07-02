@@ -6,9 +6,11 @@ from logging.handlers import TimedRotatingFileHandler
 from influxdb import InfluxDBClient
 from ryu.base import app_manager
 from ryu.controller import ofp_event, dpset
-from ryu.controller.handler import set_ev_cls, MAIN_DISPATCHER, CONFIG_DISPATCHER
-from ryu.controller.ofp_event import ofp_parser
-from ryu.ofproto import ofproto_v1_3
+from ryu.controller.handler import set_ev_cls, MAIN_DISPATCHER
+from ryu.lib.packet import ethernet
+from ryu.lib.packet import packet
+from ryu.lib.packet import vlan
+from ryu.ofproto import ofproto_v1_3, ether
 
 from dp import DP
 from logger import *
@@ -185,3 +187,22 @@ class Dashboard(app_manager.RyuApp):
         rcv_time = time.time()
         dp = self.dps[ev.msg.datapath.id]
         self.pollers[dp.dp_id]['flow_table'].update(rcv_time, ev.msg)
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    @kill_on_exception(exc_logname)
+    def _packet_in_handler(self, ev):
+        msg = ev.msg
+
+        pkt = packet.Packet(msg.data)
+        eth_pkt = pkt.get_protocols(ethernet.ethernet)[0]
+        eth_type = eth_pkt.ethertype
+
+        if eth_type == ether.ETH_TYPE_8021Q:
+            # tagged packet
+            vlan_proto = pkt.get_protocols(vlan.vlan)[0]
+            vlan_vid = vlan_proto.vid
+        else:
+            return
+
+        in_port = msg.match['in_port']
+        print "Dashboard",eth_pkt.src, eth_pkt.dst
