@@ -1,0 +1,6 @@
+.idea/
+*.iml
+*.ipr
+.python-version
+*.pyc
+*.out
