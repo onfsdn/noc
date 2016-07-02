@@ -1,8 +1,12 @@
+import json
 import logging
+import pprint
 import random
 import time
 
 from ryu.lib import hub
+
+pp = pprint.PrettyPrinter(indent=4)
 
 
 class Poller(object):
@@ -165,7 +169,7 @@ class PortStatsInfluxDBPoller(InfluxDBPoller):
             elif stat.port_no == msg.datapath.ofproto.OFPP_LOCAL:
                 port_name = "LOCAL"
             elif stat.port_no not in self.dp.ports:
-                self.logger.info("stats for unknown port %s", stat.port_no)
+                self.logger.info("stats for unknown port %s list[%s]", stat.port_no, pp.pprint(self.dp.ports))
                 continue
             else:
                 port_name = self.dp.ports[stat.port_no].name

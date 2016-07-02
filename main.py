@@ -6,14 +6,15 @@ from logging.handlers import TimedRotatingFileHandler
 from influxdb import InfluxDBClient
 from ryu.base import app_manager
 from ryu.controller import ofp_event, dpset
-from ryu.controller.handler import set_ev_cls, MAIN_DISPATCHER
+from ryu.controller.handler import set_ev_cls, MAIN_DISPATCHER, CONFIG_DISPATCHER
+from ryu.controller.ofp_event import ofp_parser
 from ryu.ofproto import ofproto_v1_3
 
 from dp import DP
 from logger import *
 from poller import *
 
-INFLUXDB_DB = "mydb"
+INFLUXDB_DB = "mydb2"
 INFLUXDB_HOST = "localhost"
 INFLUXDB_PORT = 8086
 INFLUXDB_USER = "admin"
@@ -161,6 +162,7 @@ class Dashboard(app_manager.RyuApp):
         flow_table_poller.start()
 
         self.handlers[dp.dp_id]['port_state'] = port_state_handler
+        self.pollers[dp.dp_id]['port_stats'] = port_stats_poller
         self.pollers[dp.dp_id]['flow_table'] = flow_table_poller
 
     @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
