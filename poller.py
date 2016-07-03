@@ -83,6 +83,83 @@ class InfluxDBPoller(Poller):
         return self.influxdb.write_points(points=points, time_precision='s')
 
 
+class RedisToInfluxPoller(InfluxDBPoller):
+    def update(self, rcv_time, msg):
+        pass
+
+    def no_response(self):
+        pass
+
+    def send_req(self):
+        pass
+
+    redis = None
+
+    def __init__(self, dp, ryudp, logname, influxdb, redis):
+        super(RedisToInfluxPoller, self).__init__(dp, ryudp, logname, influxdb)
+        self.redis = redis
+
+    def __call__(self):
+        while True:
+            hub.sleep(5)
+            curr_ts = int(time.time())
+            http = self.redis.hgetall("HTTP")
+            https = self.redis.hgetall("HTTPS")
+            icmp = self.redis.hgetall("ICMP")
+            tcp = self.redis.hgetall("TCP")
+            udp = self.redis.hgetall("UDP")
+
+            self.logger.warn("RedisFLush @ %s, %s, %s", time.time(), http, icmp)
+            """
+            port_tags = {
+                "dp_name": self.dp.name,
+                "port_name": port_name,
+            }
+            """
+            """
+                points = [{
+                "measurement": "port_state_reason",
+                "tags": port_tags,
+                "time": int(rcv_time),
+                "fields": {"value": reason}}]
+            """
+
+            point_http = self.collect_points(http, "HTTP", curr_ts)
+            point_https = self.collect_points(https, "HTTPS", curr_ts)
+            point_icmp = self.collect_points(icmp, "ICMP", curr_ts)
+            point_udp = self.collect_points(udp, "UDP", curr_ts)
+            point_tcp = self.collect_points(tcp, "TCP", curr_ts)
+
+            self.ship_points(point_http)
+            self.remove_flushed(point_http, "HTTP")
+
+            self.ship_points(point_https)
+            self.remove_flushed(point_https, "HTTPS")
+
+            self.ship_points(point_icmp)
+            self.remove_flushed(point_icmp, "ICMP")
+
+            self.ship_points(point_udp)
+            self.remove_flushed(point_udp, "UDP")
+
+            self.ship_points(point_tcp)
+            self.remove_flushed(point_tcp, "TCP")
+
+    def collect_points(self, http, measurement, curr_ts):
+        return [
+            {"measurement": measurement,
+             "tags": {measurement: measurement},
+             "time": int(ts),
+             "fields": {"value": count}
+             }
+            for (ts, count, ) in http.iteritems() if curr_ts - int(ts) > 5
+            ]
+
+    def remove_flushed(self, point_http, key):
+        for p in point_http:
+            self.redis.hdel(key, str(p['time']))
+
+
 class PortStatsPoller(Poller):
     """Periodically sends a port stats request to the datapath and parses and
     outputs the response."""
@@ -193,6 +270,7 @@ class PortStatsInfluxDBPoller(InfluxDBPoller):
                     "time": int(rcv_time),
                     "fields": {"value": stat_value}})
         if not self.ship_points(points):
+            self.logger.warn("PS Points [%s]", points)
             self.logger.warn("error shipping port_stats points")
 
     def no_response(self):

@@ -45,5 +45,8 @@ class PortStateInfluxDBLogger(PortStateLogger):
                 "tags": port_tags,
                 "time": int(rcv_time),
                 "fields": {"value": reason}}]
+
+            self.logger.warn("Port Status %s", points)
+            print "Port Status {0}".format(points)
             if not self.ship_points(points):
                 self.logger.warning("error shipping port_state_reason points")

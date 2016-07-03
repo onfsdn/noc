@@ -33,11 +33,11 @@ from influxdb import InfluxDBClient
 
 
 # TODO: configurable
-INFLUXDB_DB = "faucet"
+INFLUXDB_DB = "mydb"
 INFLUXDB_HOST = "localhost"
 INFLUXDB_PORT = 8086
-INFLUXDB_USER = ""
-INFLUXDB_PASS = ""
+INFLUXDB_USER = "admin"
+INFLUXDB_PASS = "admin"
 
 
 def ship_points_to_influxdb(points):
@@ -265,13 +265,13 @@ class GaugePortStatsInfluxDBPoller(GaugeInfluxDBPoller):
             }
 
             for stat_name, stat_value in (
-                    ("packets_out", stat.tx_packets),
-                    ("packets_in", stat.rx_packets),
-                    ("bytes_out", stat.tx_bytes),
-                    ("bytes_in", stat.rx_bytes),
-                    ("dropped_out", stat.tx_dropped),
-                    ("dropped_in", stat.rx_dropped),
-                    ("errors_in", stat.rx_errors)):
+                ("packets_out", stat.tx_packets),
+                ("packets_in", stat.rx_packets),
+                ("bytes_out", stat.tx_bytes),
+                ("bytes_in", stat.rx_bytes),
+                ("dropped_out", stat.tx_dropped),
+                ("dropped_in", stat.rx_dropped),
+                ("errors_in", stat.rx_errors)):
                 points.append({
                     "measurement": stat_name,
                     "tags": port_tags,
@@ -393,66 +393,56 @@ class Gauge(app_manager.RyuApp):
 
     @set_ev_cls(dpset.EventDP, dpset.DPSET_EV_DISPATCHER)
     @kill_on_exception(exc_logname)
-    def handler_connect_or_disconnect(self, ev):
+    def handler_datapath(self, ev):
         ryudp = ev.dp
         if ryudp.id not in self.dps:
-            self.logger.info("dp not in self.dps {0}".format(ryudp.id))
+            self.logger.info("dp not in self.dps{1} {0}".format(ryudp.id,  self.dps.keys()))
             return
 
         dp = self.dps[ryudp.id]
 
-        if ev.enter: # DP is connecting
+        if ev.enter:
+            # Set up a thread to poll for port stats
+            # TODO: set up threads to poll for other stats as well
+            # TODO: allow the different things to be polled for to be
+            # configurable
             self.logger.info("datapath up %x", dp.dp_id)
-            self.handler_datapath(ev)
-        else: # DP is disconnecting
+            dp.running = True
+            if dp.dp_id not in self.pollers:
+                self.pollers[dp.dp_id] = {}
+                self.handlers[dp.dp_id] = {}
+
+            if dp.influxdb_stats:
+                port_state_handler = GaugePortStateInfluxDBLogger(
+                    dp, ryudp, self.logname)
+            else:
+                port_state_handler = GaugePortStateLogger(
+                    dp, ryudp, self.logname)
+            self.handlers[dp.dp_id]['port_state'] = port_state_handler
+
+            if dp.monitor_ports:
+                if dp.influxdb_stats:
+                    port_stats_poller = GaugePortStatsInfluxDBPoller(
+                       dp, ryudp, self.logname)
+                else:
+                    port_stats_poller = GaugePortStatsPoller(
+                        dp, ryudp, self.logname)
+                self.pollers[dp.dp_id]['port_stats'] = port_stats_poller
+                port_stats_poller.start()
+
+            if dp.monitor_flow_table:
+                flow_table_poller = GaugeFlowTablePoller(
+                    dp, ryudp, self.logname)
+                self.pollers[dp.dp_id]['flow_table'] = flow_table_poller
+                flow_table_poller.start()
+
+        else:
             if dp.dp_id in self.pollers:
                 for poller in self.pollers[dp.dp_id].values():
                     poller.stop()
                 del self.pollers[dp.dp_id]
             self.logger.info("datapath down %x", dp.dp_id)
             dp.running = False
-
-    @set_ev_cls(dpset.EventDPReconnected, dpset.DPSET_EV_DISPATCHER)
-    @kill_on_exception(exc_logname)
-    def handler_reconnect(self, ev):
-        self.logger.info("datapath reconnected %x", self.dps[ev.dp.id].dp_id)
-        self.handler_datapath(ev)
-
-    def handler_datapath(self, ev):
-        ryudp = ev.dp
-        dp = self.dps[ryudp.id]
-        # Set up a thread to poll for port stats
-        # TODO: set up threads to poll for other stats as well
-        # TODO: allow the different things to be polled for to be
-        # configurable
-        dp.running = True
-        if dp.dp_id not in self.pollers:
-            self.pollers[dp.dp_id] = {}
-            self.handlers[dp.dp_id] = {}
-
-        if dp.influxdb_stats:
-            port_state_handler = GaugePortStateInfluxDBLogger(
-                dp, ryudp, self.logname)
-        else:
-            port_state_handler = GaugePortStateLogger(
-                dp, ryudp, self.logname)
-        self.handlers[dp.dp_id]['port_state'] = port_state_handler
-
-        if dp.monitor_ports:
-            if dp.influxdb_stats:
-                port_stats_poller = GaugePortStatsInfluxDBPoller(
-                    dp, ryudp, self.logname)
-            else:
-                port_stats_poller = GaugePortStatsPoller(
-                    dp, ryudp, self.logname)
-            self.pollers[dp.dp_id]['port_stats'] = port_stats_poller
-            port_stats_poller.start()
-
-        if dp.monitor_flow_table:
-            flow_table_poller = GaugeFlowTablePoller(
-                dp, ryudp, self.logname)
-            self.pollers[dp.dp_id]['flow_table'] = flow_table_poller
-            flow_table_poller.start()
 
     @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
     @kill_on_exception(exc_logname)

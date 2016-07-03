@@ -3,18 +3,24 @@ import signal
 from functools import wraps
 from logging.handlers import TimedRotatingFileHandler
 
+import redis
 from influxdb import InfluxDBClient
 from ryu.base import app_manager
 from ryu.controller import ofp_event, dpset
-from ryu.controller.handler import set_ev_cls, MAIN_DISPATCHER
+from ryu.controller.handler import set_ev_cls, MAIN_DISPATCHER, CONFIG_DISPATCHER
 from ryu.lib.packet import ethernet
+from ryu.lib.packet import ipv4
 from ryu.lib.packet import packet
+from ryu.lib.packet import tcp
 from ryu.lib.packet import vlan
 from ryu.ofproto import ofproto_v1_3, ether
 
 from dp import DP
 from logger import *
 from poller import *
+from valve import valve_factory
+
+r = redis.StrictRedis()
 
 INFLUXDB_DB = "mydb2"
 INFLUXDB_HOST = "localhost"
@@ -60,6 +66,8 @@ class Dashboard(app_manager.RyuApp):
 
     logname = 'dashboard'
     exc_logname = 'dashboard.exception'
+    redis = r
+    influxdb = influxdb_client
 
     def create_logger(self):
         exc_logfile = os.getenv('GAUGE_EXCEPTION_LOG', '/var/tmp/dashboard_exception.log')
@@ -74,6 +82,7 @@ class Dashboard(app_manager.RyuApp):
         default_formatter = logging.Formatter(log_fmt, date_fmt)
         logger_handler.setFormatter(default_formatter)
         logger.addHandler(logger_handler)
+        logger.setLevel(logging.INFO)
         logger.propagate = 0
 
         # Set up separate logging for exceptions
@@ -100,6 +109,7 @@ class Dashboard(app_manager.RyuApp):
                 dp = DP.parser(dp_conf_file.strip(), self.logname)
                 try:
                     dp.sanity_check()
+                    self.valve = valve_factory(dp)
                 except AssertionError:
                     self.logger.exception(
                         "Error in config file {0}".format(dp_conf_file))
@@ -115,6 +125,93 @@ class Dashboard(app_manager.RyuApp):
         self.pollers = {}
         # dict of async event handlers
         self.handlers = {}
+
+        self.redis_flush_thread = hub.spawn(self.redis_flush_request)
+
+    def redis_flush_request(self):
+        while True:
+            hub.sleep(5)
+            curr_ts = int(time.time())
+            http = self.redis.hgetall("HTTP")
+            https = self.redis.hgetall("HTTPS")
+            icmp = self.redis.hgetall("ICMP")
+            tcp = self.redis.hgetall("TCP")
+            udp = self.redis.hgetall("UDP")
+            arp = self.redis.hgetall("ARP")
+
+            self.logger.warn("RedisFLush @ %s, %s, %s", time.time(), http, icmp)
+            """
+            port_tags = {
+                "dp_name": self.dp.name,
+                "port_name": port_name,
+            }
+            """
+            """
+                points = [{
+                "measurement": "port_state_reason",
+                "tags": port_tags,
+                "time": int(rcv_time),
+                "fields": {"value": reason}}]
+            """
+
+            point_http = self.collect_points(http, "HTTP", curr_ts)
+            point_https = self.collect_points(https, "HTTPS", curr_ts)
+            point_icmp = self.collect_points(icmp, "ICMP", curr_ts)
+            point_udp = self.collect_points(udp, "UDP", curr_ts)
+            point_tcp = self.collect_points(tcp, "TCP", curr_ts)
+            point_arp = self.collect_points(arp, "ARP", curr_ts)
+            self.logger.warn("Points %s %s", point_icmp, icmp)
+            # import  pdb; pdb.set_trace()
+            if not self.ship_points(point_http):
+                self.logger.warning("Not OK push to influx")
+            self.remove_flushed(point_http, "HTTP")
+            self.ship_points(point_https)
+            self.remove_flushed(point_https, "HTTPS")
+
+            if not self.ship_points(point_icmp):
+                self.logger.warning("Not OK push to influx")
+            self.remove_flushed(point_icmp, "ICMP")
+
+            self.ship_points(point_udp)
+            self.remove_flushed(point_udp, "UDP")
+
+            self.ship_points(point_tcp)
+            self.remove_flushed(point_tcp, "TCP")
+
+            self.ship_points(point_arp)
+            self.remove_flushed(point_arp, "ARP")
+
+            mac_points = []
+            for mac in self.redis.smembers("MACS-LIST"):
+                counts = self.redis.hgetall("MACS:" + mac)
+                self.logger.warn("Found %s -> %s", mac, counts)
+                for ts, count in counts.iteritems():
+                    if curr_ts - int(ts) > 5:
+                        mac_points.append({
+                            "measurement": "MAC",
+                            "tags": {"mac": mac},
+                            "time": curr_ts,
+                            "fields": {"value": int(count)}
+                        })
+                        self.redis.hdel("MACS:" + mac, ts)
+            self.ship_points(mac_points)
+
+    def remove_flushed(self, point_http, key):
+        for p in point_http:
+            self.redis.hdel(key, str(p['time']))
+
+    def collect_points(self, http, measurement, curr_ts):
+        return [
+            {"measurement": measurement,
+             "tags": {"proto": measurement},
+             "time": int(ts),
+             "fields": {"value": int(count)}
+             }
+            for (ts, count,) in http.iteritems() if curr_ts - int(ts) > 5
+            ]
+
+    def ship_points(self, points):
+        return self.influxdb.write_points(points=points, time_precision='s')
 
     @set_ev_cls(dpset.EventDP, dpset.DPSET_EV_DISPATCHER)
     @kill_on_exception(exc_logname)
@@ -167,6 +264,18 @@ class Dashboard(app_manager.RyuApp):
         self.pollers[dp.dp_id]['port_stats'] = port_stats_poller
         self.pollers[dp.dp_id]['flow_table'] = flow_table_poller
 
+        dp = ev.dp
+
+        if not ev.enter:
+            # Datapath down message
+            self.valve.datapath_disconnect(dp.id)
+            return
+
+        discovered_ports = [
+            p.port_no for p in dp.ports.values() if p.state == 0]
+        flowmods = self.valve.datapath_connect(dp.id, discovered_ports)
+        self.send_flow_msgs(dp, flowmods)
+
     @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
     @kill_on_exception(exc_logname)
     def port_status_handler(self, ev):
@@ -192,17 +301,84 @@ class Dashboard(app_manager.RyuApp):
     @kill_on_exception(exc_logname)
     def _packet_in_handler(self, ev):
         msg = ev.msg
+        dp = msg.datapath
 
         pkt = packet.Packet(msg.data)
         eth_pkt = pkt.get_protocols(ethernet.ethernet)[0]
         eth_type = eth_pkt.ethertype
+        ts = int(time.time())
+        delta = ts % 5
+        capture_ts = ts - delta
 
-        if eth_type == ether.ETH_TYPE_8021Q:
+
+        mac = eth_pkt.src
+        r.hincrby("MACS:" + mac, str(capture_ts), 1)
+        r.sadd("MACS-LIST", mac)
+
+        if eth_type == ether.ETH_TYPE_ARP:
+            r.hincrby("ARP", str(capture_ts), 1)
+        elif eth_type == ether.ETH_TYPE_8021Q:
             # tagged packet
             vlan_proto = pkt.get_protocols(vlan.vlan)[0]
             vlan_vid = vlan_proto.vid
-        else:
-            return
+            ip_pkt = pkt.get_protocol(ipv4.ipv4)
 
-        in_port = msg.match['in_port']
-        print "Dashboard",eth_pkt.src, eth_pkt.dst
+            if ip_pkt:
+
+                ip_proto = ip_pkt.proto
+
+                if ip_proto == 6:
+                    tcp_pkt = pkt.get_protocol(tcp.tcp)
+                    dst_prt = tcp_pkt.dst_port
+                    if dst_prt == 80 or dst_prt == 8000:
+                        print "OK", r.hincrby("HTTP", str(capture_ts), 1)
+                    elif dst_prt == "443":
+                        r.hincrby("HTTPS", str(capture_ts), 1)
+                    else:
+                        r.hincrby("TCP", str(capture_ts), 1)
+                elif ip_proto == 1:
+                    r.hincrby("ICMP", str(capture_ts), 1)
+                elif ip_proto == 17:
+                    r.hincrby("UDP", str(capture_ts), 1)
+                else:
+                    r.hincrby("OTHER", str(capture_ts), 1)
+
+            in_port = msg.match['in_port']
+            flowmods = self.valve.rcv_packet(dp.id, in_port, vlan_vid, msg.match, pkt)
+            self.send_flow_msgs(dp, flowmods)
+
+        elif eth_type == ether.ETH_TYPE_IP:
+            ip_pkt = pkt.get_protocol(ipv4.ipv4)
+
+            if ip_pkt:
+
+                ip_proto = ip_pkt.proto
+
+                if ip_proto == 6:
+                    tcp_pkt = pkt.get_protocol(tcp.tcp)
+                    dst_prt = tcp_pkt.dst_port
+                    if dst_prt == 80 or dst_prt == 8000:
+                        print "OK", r.hincrby("HTTP", str(capture_ts), 1)
+                    elif dst_prt == 443:
+                        r.hincrby("HTTPS", str(capture_ts), 1)
+                    else:
+                        r.hincrby("TCP", str(capture_ts), 1)
+                elif ip_proto == 1:
+                    r.hincrby("ICMP", str(capture_ts), 1)
+                elif ip_proto == 17:
+                    r.hincrby("UDP", str(capture_ts), 1)
+                else:
+                    r.hincrby("OTHER", str(capture_ts), 1)
+
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def handler_features(self, ev):
+        msg = ev.msg
+        dp = msg.datapath
+        flowmods = self.valve.switch_features(dp.id, msg)
+        self.send_flow_msgs(dp, flowmods)
+
+    def send_flow_msgs(self, dp, flow_msgs):
+        self.valve.ofchannel_log(flow_msgs)
+        for flow_msg in flow_msgs:
+            flow_msg.datapath = dp
+            dp.send_msg(flow_msg)
